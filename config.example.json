@@ -1,0 +1,19 @@
+{
+  "log_level": "info",
+  "database_path": "usage.sqlite",
+  "listen": "127.0.0.1",
+  "listen_port": 8080,
+  "tls": {
+    "enabled": false,
+    "certificate_path": "",
+    "key_path": ""
+  },
+  "credential_path": "",
+  "users": [
+    {
+      "name": "local",
+      "token": "replace-with-your-secret-token"
+    }
+  ],
+  "headers": {}
+}

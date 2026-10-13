@@ -1,0 +1,34 @@
+{
+  "log_level": "info",
+  "database_path": "usage.sqlite",
+  "ocm": {
+    "listen": "0.0.0.0",
+    "listen_port": 8080,
+    "credential_path": "",
+    "users": [
+      {
+        "name": "local",
+        "token": "dEW#u2UHay3Q#m0.eyB"
+      }
+    ],
+    "headers": {},
+    "tls": {
+      "enabled": false
+    }
+  },
+  "ccm": {
+    "listen": "0.0.0.0",
+    "listen_port": 8081,
+    "credential_path": "",
+    "users": [
+      {
+        "name": "local",
+        "token": "dEW#u2UHay3Q#m0.eyB"
+      }
+    ],
+    "headers": {},
+    "tls": {
+      "enabled": false
+    }
+  }
+}
