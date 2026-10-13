@@ -68,7 +68,7 @@ func (s *Service) writeModelsResponse(w http.ResponseWriter, incoming *http.Requ
 		return
 	}
 	proxy.CopyHeaders(w.Header(), response.Header)
-	for _, header := range []string{"Content-Length", "Content-Encoding", "Content-MD5", "Digest"} {
+	for _, header := range []string{"Content-Length", "Content-Encoding", "Content-MD5", "Digest", "ETag"} {
 		w.Header().Del(header)
 	}
 	w.Header().Set("Content-Type", "application/json")
