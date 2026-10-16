@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// ErrRefreshRejected means the provider definitively issued no tokens.
+var ErrRefreshRejected = errors.New("token endpoint rejected refresh")
+
 // RefreshOps keeps credential representation and provider calls outside persistence.
 type RefreshOps[T any] struct {
 	Read         func(context.Context) (T, error)
@@ -76,7 +79,7 @@ func rotate[T any](ctx context.Context, lock *CredentialLock, before T, refresh 
 		}
 	}}
 	refreshed, err := refresh(httptrace.WithClientTrace(ctx, trace), before)
-	if err != nil && !sent.Load() {
+	if err != nil && (!sent.Load() || errors.Is(err, ErrRefreshRejected)) {
 		err = errors.Join(err, lock.CompleteRotation())
 	}
 	return refreshed, err

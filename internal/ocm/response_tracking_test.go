@@ -2,6 +2,7 @@ package ocm
 
 import (
 	"compress/gzip"
+	"database/sql"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,44 @@ import (
 
 const jsonResponse = `{"id":"resp_test","model":"gpt-5.4","service_tier":"default","usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":10}}}`
 const chatResponse = `{"model":"gpt-5.4","service_tier":"default","usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":10}}}`
+
+func TestNonStreamingResponseReadFailureForwardsPartialBody(t *testing.T) {
+	for _, tc := range []struct {
+		path, body string
+	}{
+		{"/v1/responses", jsonResponse[:len(jsonResponse)-1]},
+		{"/v1/chat/completions", chatResponse[:len(chatResponse)-1]},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)+100))
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer upstream.Close()
+			service := startTestService(t, upstream.URL, false, io.Discard)
+			request := httptest.NewRequest("POST", tc.path, strings.NewReader(`{"model":"gpt-5.4"}`))
+			request.Header.Set("Authorization", "Bearer client-key")
+			writer := httptest.NewRecorder()
+			service.ServeHTTP(writer, request)
+			if writer.Code != http.StatusOK || writer.Body.String() != tc.body {
+				t.Fatalf("partial response changed: %d %q", writer.Code, writer.Body.String())
+			}
+			db, err := sql.Open("sqlite", testUsagePath(service))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var count int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM usage_records`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("partial response recorded %d usage records", count)
+			}
+		})
+	}
+}
 
 func TestGzipResponseUsage(t *testing.T) {
 	for _, tc := range []struct {

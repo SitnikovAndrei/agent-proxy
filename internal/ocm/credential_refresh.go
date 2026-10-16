@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"ocm/internal/persistence"
 )
 
 type oauthRefreshRequest struct {
@@ -37,6 +39,9 @@ func refreshToken(ctx context.Context, client *http.Client, credentials *oauthCr
 		return nil, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
+		return nil, fmt.Errorf("refresh failed: HTTP %d: %w", response.StatusCode, persistence.ErrRefreshRejected)
+	}
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("refresh failed: HTTP %d", response.StatusCode)
 	}

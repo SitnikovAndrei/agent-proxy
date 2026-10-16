@@ -12,6 +12,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"time"
+
+	"ocm/internal/persistence"
 )
 
 const (
@@ -90,6 +92,9 @@ func refreshToken(ctx context.Context, client *http.Client, credentials oauthCre
 		return oauthCredentials{}, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
+		return oauthCredentials{}, fmt.Errorf("refresh failed: HTTP %d: %w", response.StatusCode, persistence.ErrRefreshRejected)
+	}
 	if response.StatusCode != http.StatusOK {
 		return oauthCredentials{}, fmt.Errorf("refresh failed: HTTP %d", response.StatusCode)
 	}

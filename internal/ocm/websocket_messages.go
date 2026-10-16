@@ -10,6 +10,28 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
+type webSocketWriter struct {
+	mutex sync.Mutex
+	dst   io.Writer
+	state ws.State
+}
+
+func (w *webSocketWriter) writeMessage(op ws.OpCode, data []byte) error {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	return wsutil.WriteMessage(w.dst, w.state, op, data)
+}
+
+func (w *webSocketWriter) controlHandler() wsutil.FrameHandlerFunc {
+	handler := wsutil.ControlFrameHandler(w.dst, w.state)
+	return func(header ws.Header, source io.Reader) error {
+		// A control reply can also write its header and payload separately.
+		w.mutex.Lock()
+		defer w.mutex.Unlock()
+		return handler(header, source)
+	}
+}
+
 type responseModelQueue struct {
 	mutex  sync.Mutex
 	models []string
@@ -34,9 +56,9 @@ func (q *responseModelQueue) pop() string {
 }
 
 // Bound both individual frames and the aggregate of fragmented messages.
-func readLimitedClientData(rw io.ReadWriter) ([]byte, ws.OpCode, error) {
-	control := wsutil.ControlFrameHandler(rw, ws.StateServerSide)
-	reader := wsutil.Reader{Source: rw, State: ws.StateServerSide, CheckUTF8: true,
+func readLimitedClientData(source io.Reader, writer *webSocketWriter) ([]byte, ws.OpCode, error) {
+	control := writer.controlHandler()
+	reader := wsutil.Reader{Source: source, State: ws.StateServerSide, CheckUTF8: true,
 		MaxFrameSize: proxy.MaxRequestBodyBytes, OnIntermediate: control}
 	for {
 		header, err := reader.NextFrame()
@@ -57,5 +79,25 @@ func readLimitedClientData(rw io.ReadWriter) ([]byte, ws.OpCode, error) {
 			return nil, 0, wsutil.ErrFrameTooLarge
 		}
 		return data, header.OpCode, nil
+	}
+}
+
+func readUpstreamWebSocketData(source io.Reader, writer *webSocketWriter) ([]byte, ws.OpCode, error) {
+	control := writer.controlHandler()
+	reader := wsutil.Reader{Source: source, State: ws.StateClientSide, CheckUTF8: true,
+		OnIntermediate: control}
+	for {
+		header, err := reader.NextFrame()
+		if err != nil {
+			return nil, 0, err
+		}
+		if header.OpCode.IsControl() {
+			if err := control(header, &reader); err != nil {
+				return nil, 0, err
+			}
+			continue
+		}
+		data, err := io.ReadAll(&reader)
+		return data, header.OpCode, err
 	}
 }

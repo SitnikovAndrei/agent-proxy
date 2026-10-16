@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptrace"
 	"os"
 	"path/filepath"
@@ -108,17 +109,30 @@ func TestRefreshRetriesChangedFile(t *testing.T) {
 }
 
 func TestRefreshFailureMarker(t *testing.T) {
-	for _, sent := range []bool{false, true} {
-		t.Run(map[bool]string{false: "pre-send", true: "post-send"}[sent], func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sent     bool
+		rejected bool
+	}{
+		{name: "pre-send"},
+		{name: "post-send", sent: true},
+		{name: "rejected", sent: true, rejected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			path, ops := refreshFixture(t)
 			failure := errors.New("refresh failed")
+			if tc.rejected {
+				failure = fmt.Errorf("refresh failed: %w", ErrRefreshRejected)
+			}
+			calls := 0
 			ops.Refresh = func(ctx context.Context, c testCredentials) (testCredentials, error) {
+				calls++
 				trace := httptrace.ContextClientTrace(ctx)
 				if trace == nil {
 					t.Fatal("missing request trace")
 				}
 				info := httptrace.WroteRequestInfo{}
-				if !sent {
+				if !tc.sent {
 					info.Err = failure
 				}
 				trace.WroteRequest(info)
@@ -127,17 +141,15 @@ func TestRefreshFailureMarker(t *testing.T) {
 			if _, err := RefreshUnderLock(context.Background(), path, time.Second, ops); !errors.Is(err, failure) {
 				t.Fatal(err)
 			}
-			lock, err := LockCredentials(context.Background(), path)
-			if err != nil {
-				t.Fatal(err)
+			_, err := RefreshUnderLock(context.Background(), path, time.Second, ops)
+			if tc.sent && !tc.rejected {
+				if !errors.Is(err, ErrUncertainRotation) || calls != 1 {
+					t.Fatalf("lost marker: %v", err)
+				}
+				return
 			}
-			defer lock.Close()
-			err = lock.BeginRotation(context.Background(), "old", "old")
-			if sent && !errors.Is(err, ErrUncertainRotation) {
-				t.Fatalf("lost marker: %v", err)
-			}
-			if !sent && err != nil {
-				t.Fatalf("pre-send marker retained: %v", err)
+			if !errors.Is(err, failure) || errors.Is(err, ErrUncertainRotation) || calls != 2 {
+				t.Fatalf("refresh should be retryable: calls=%d err=%v", calls, err)
 			}
 		})
 	}

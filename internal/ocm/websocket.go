@@ -116,15 +116,12 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 	}
 	defer s.lifecycle.Unregister(session)
 
-	var upstreamReadWriter io.ReadWriter
+	var upstreamReader io.Reader = upstreamConn
 	if upstreamBufferedReader != nil {
-		upstreamReadWriter = struct {
-			io.Reader
-			io.Writer
-		}{upstreamBufferedReader, upstreamConn}
-	} else {
-		upstreamReadWriter = upstreamConn
+		upstreamReader = upstreamBufferedReader
 	}
+	clientWriter := &webSocketWriter{dst: clientConn, state: ws.StateServerSide}
+	upstreamWriter := &webSocketWriter{dst: upstreamConn, state: ws.StateClientSide}
 
 	models := &responseModelQueue{}
 	var waitGroup sync.WaitGroup
@@ -133,19 +130,19 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 	go func() {
 		defer waitGroup.Done()
 		defer session.Close()
-		s.proxyWebSocketClientToUpstream(clientConn, upstreamConn, models)
+		s.proxyWebSocketClientToUpstream(clientConn, clientWriter, upstreamWriter, models)
 	}()
 	go func() {
 		defer waitGroup.Done()
 		defer session.Close()
-		s.proxyWebSocketUpstreamToClient(upstreamReadWriter, clientConn, models, username, weeklyCycleHint)
+		s.proxyWebSocketUpstreamToClient(upstreamReader, upstreamWriter, clientWriter, models, username, weeklyCycleHint)
 	}()
 	waitGroup.Wait()
 }
 
-func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamConn net.Conn, models *responseModelQueue) {
+func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, clientWriter, upstreamWriter *webSocketWriter, models *responseModelQueue) {
 	for {
-		data, opCode, err := readLimitedClientData(clientConn)
+		data, opCode, err := readLimitedClientData(clientConn, clientWriter)
 		if err != nil {
 			if !isClosedOrCanceled(err) {
 				s.logger.Debug("read client websocket", "error", err)
@@ -163,7 +160,7 @@ func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamCo
 			}
 		}
 
-		err = wsutil.WriteClientMessage(upstreamConn, opCode, data)
+		err = upstreamWriter.writeMessage(opCode, data)
 		if err != nil {
 			if !isClosedOrCanceled(err) {
 				s.logger.Debug("write upstream websocket", "error", err)
@@ -173,10 +170,10 @@ func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamCo
 	}
 }
 
-func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWriter, clientConn net.Conn, models *responseModelQueue, username string, weeklyCycleHint *WeeklyCycleHint) {
+func (s *Service) proxyWebSocketUpstreamToClient(upstreamReader io.Reader, upstreamWriter, clientWriter *webSocketWriter, models *responseModelQueue, username string, weeklyCycleHint *WeeklyCycleHint) {
 	finalized := make(map[string]struct{})
 	for {
-		data, opCode, err := wsutil.ReadServerData(upstreamReadWriter)
+		data, opCode, err := readUpstreamWebSocketData(upstreamReader, upstreamWriter)
 		if err != nil {
 			if !isClosedOrCanceled(err) {
 				s.logger.Debug("read upstream websocket", "error", err)
@@ -209,7 +206,7 @@ func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWrite
 			}
 		}
 
-		err = wsutil.WriteServerMessage(clientConn, opCode, data)
+		err = clientWriter.writeMessage(opCode, data)
 		if err != nil {
 			if !isClosedOrCanceled(err) {
 				s.logger.Debug("write client websocket", "error", err)

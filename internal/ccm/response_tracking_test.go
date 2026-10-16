@@ -2,11 +2,13 @@ package ccm
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -16,6 +18,41 @@ import (
 const usageStart = `{"type":"message_start","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":4}}}}`
 const usageDeltaEvent = `{"type":"message_delta","usage":{"output_tokens":7}}`
 const usageStop = `{"type":"message_stop"}`
+
+func TestNonStreamingResponseReadFailureForwardsPartialBody(t *testing.T) {
+	const body = `{"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":7},"content":[`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)+100))
+		_, _ = io.WriteString(w, body)
+	}))
+	defer upstream.Close()
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := statistics.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := requestTestService(t, upstream.URL)
+	service.usage = &usageTracker{store: store}
+	writer := httptest.NewRecorder()
+	service.ServeHTTP(writer, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[]}`)))
+	if writer.Code != http.StatusOK || writer.Body.String() != body {
+		t.Fatalf("partial response changed: %d %q", writer.Code, writer.Body.String())
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM usage_records`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("partial response recorded %d usage records", count)
+	}
+}
 
 func TestStreamUsageAcrossReads(t *testing.T) {
 	saved := 0

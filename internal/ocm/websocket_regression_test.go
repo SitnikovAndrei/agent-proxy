@@ -5,7 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +19,116 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
+
+func TestWebSocketConcurrentControlAndDataWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	release := make(chan struct{})
+	upstreamResult := make(chan error, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _, err := ws.UpgradeHTTP(r, w)
+		if err != nil {
+			upstreamResult <- err
+			return
+		}
+		defer conn.Close()
+		deadline, _ := ctx.Deadline()
+		_ = conn.SetDeadline(deadline)
+		upstreamResult <- exchangeWebSocketFrames(conn, conn, ws.StateServerSide, "upstream", "client")
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}))
+	defer upstream.Close()
+	defer close(release)
+	service := startTestService(t, upstream.URL, true, io.Discard)
+	dialer := ws.Dialer{Header: ws.HandshakeHeaderHTTP(http.Header{"Authorization": []string{"Bearer client-key"}})}
+	conn, buffered, _, err := dialer.Dial(ctx, "ws://"+service.listener.Addr().String()+"/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	deadline, _ := ctx.Deadline()
+	_ = conn.SetDeadline(deadline)
+	var source io.Reader = conn
+	if buffered != nil {
+		source = buffered
+	}
+	if err := exchangeWebSocketFrames(conn, source, ws.StateClientSide, "client", "upstream"); err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	select {
+	case err := <-upstreamResult:
+		if err != nil {
+			t.Fatalf("upstream: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+const concurrentWebSocketMessages = 256
+
+func webSocketTestPayload(sender string, index int) []byte {
+	return []byte(fmt.Sprintf("%s:%d:%s", sender, index, strings.Repeat("x", 32*1024)))
+}
+
+func exchangeWebSocketFrames(conn net.Conn, source io.Reader, state ws.State, sender, peer string) error {
+	written := make(chan error, 1)
+	go func() {
+		for i := range concurrentWebSocketMessages {
+			if err := wsutil.WriteMessage(conn, state, ws.OpPing, []byte(fmt.Sprintf("%s:%d", sender, i))); err != nil {
+				written <- err
+				return
+			}
+			if err := wsutil.WriteMessage(conn, state, ws.OpText, webSocketTestPayload(sender, i)); err != nil {
+				written <- err
+				return
+			}
+		}
+		written <- nil
+	}()
+	err := receiveWebSocketFrames(source, state, sender, peer)
+	if err != nil {
+		conn.Close()
+	}
+	writeErr := <-written
+	if err != nil {
+		return err
+	}
+	return writeErr
+}
+
+func receiveWebSocketFrames(source io.Reader, state ws.State, sender, peer string) error {
+	reader := wsutil.Reader{Source: source, State: state, CheckUTF8: true, MaxFrameSize: 64 * 1024}
+	dataCount, pongCount := 0, 0
+	for dataCount < concurrentWebSocketMessages || pongCount < concurrentWebSocketMessages {
+		header, err := reader.NextFrame()
+		if err != nil {
+			return err
+		}
+		payload, err := io.ReadAll(&reader)
+		if err != nil {
+			return err
+		}
+		switch header.OpCode {
+		case ws.OpText:
+			if dataCount >= concurrentWebSocketMessages || !bytes.Equal(payload, webSocketTestPayload(peer, dataCount)) {
+				return fmt.Errorf("corrupt data message %d (length %d)", dataCount, len(payload))
+			}
+			dataCount++
+		case ws.OpPong:
+			if pongCount >= concurrentWebSocketMessages || string(payload) != fmt.Sprintf("%s:%d", sender, pongCount) {
+				return fmt.Errorf("corrupt pong %d", pongCount)
+			}
+			pongCount++
+		default:
+			return fmt.Errorf("unexpected opcode %v", header.OpCode)
+		}
+	}
+	return nil
+}
 
 func TestWebSocketPipelinedFinalUsage(t *testing.T) {
 	for _, override := range []bool{false, true} {
@@ -141,10 +253,7 @@ func TestWebSocketMessageLimit(t *testing.T) {
 			}
 			source = io.MultiReader(&header, io.LimitReader(repeatingBody{}, proxy.MaxRequestBodyBytes/2), &continuation, io.LimitReader(repeatingBody{}, proxy.MaxRequestBodyBytes/2+1))
 		}
-		_, _, err := readLimitedClientData(struct {
-			io.Reader
-			io.Writer
-		}{source, io.Discard})
+		_, _, err := readLimitedClientData(source, &webSocketWriter{dst: io.Discard, state: ws.StateServerSide})
 		if !errors.Is(err, wsutil.ErrFrameTooLarge) {
 			t.Fatalf("fragmented=%v error=%v", fragmented, err)
 		}
@@ -163,10 +272,7 @@ func TestWebSocketControlAndFragmentedData(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	data, op, err := readLimitedClientData(struct {
-		io.Reader
-		io.Writer
-	}{&source, &output})
+	data, op, err := readLimitedClientData(&source, &webSocketWriter{dst: &output, state: ws.StateServerSide})
 	if err != nil || op != ws.OpText || string(data) != "hello" {
 		t.Fatalf("data=%q op=%v err=%v", data, op, err)
 	}

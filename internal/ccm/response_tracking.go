@@ -34,6 +34,7 @@ func (s *Service) handleTrackedResponse(writer http.ResponseWriter, response *ht
 		body, err := io.ReadAll(response.Body)
 		if err != nil {
 			s.logger.Error("read Claude response", "error", err)
+			_, _ = writer.Write(body)
 			return
 		}
 		var message responseMessage

@@ -66,6 +66,7 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 		body, err := io.ReadAll(response.Body)
 		if err != nil {
 			s.logger.Error("read response body", "error", err)
+			_, _ = writer.Write(body)
 			return
 		}
 		if usage, err := parseJSONUsage(body, chat); err == nil {
