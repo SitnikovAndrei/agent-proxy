@@ -1,5 +1,8 @@
 /ocm.exe
 /ocm
+/ocm-*
+/api-proxy
+/api-proxy.exe
 config.json
 *.tmp
 
@@ -10,3 +13,6 @@ auth.json
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
+
+.vs/
+.idea/

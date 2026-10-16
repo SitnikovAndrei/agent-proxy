@@ -52,6 +52,7 @@ func (s *Service) handleTrackedResponse(writer http.ResponseWriter, response *ht
 
 type streamUsageTracker struct {
 	pending  []byte
+	splitter *proxy.SSELineSplitter
 	message  responseMessage
 	record   func(responseMessage)
 	logger   *slog.Logger
@@ -61,23 +62,14 @@ type streamUsageTracker struct {
 }
 
 func (t *streamUsageTracker) consume(data []byte) {
-	if t.recorded || t.disabled {
-		return
-	}
-	t.pending = append(t.pending, data...)
-	for {
-		line, rest, found := bytes.Cut(t.pending, []byte("\n"))
-		if !found {
-			break
+	if t.splitter == nil {
+		t.splitter = &proxy.SSELineSplitter{Buffer: &t.pending,
+			Max: 16 << 20, OnLine: t.consumeLine, PendingOnly: true,
+			Done:       func() bool { return t.recorded || t.disabled },
+			OnOverflow: func() { t.logger.Error("Claude usage event exceeds 16 MiB"); t.disabled = true },
 		}
-		t.consumeLine(line)
-		t.pending = rest
 	}
-	if len(t.pending) > 16*1024*1024 {
-		t.logger.Error("Claude usage event exceeds 16 MiB")
-		t.disabled = true
-		t.pending = nil
-	}
+	t.splitter.Write(data)
 }
 
 func (t *streamUsageTracker) consumeLine(line []byte) {
@@ -106,7 +98,7 @@ func (t *streamUsageTracker) consumeLine(line []byte) {
 		t.message.Usage.apply(event.Usage)
 	case messageStop, streamError:
 		t.save()
-	case contentBlockStart, contentBlockDelta, contentBlockStop, streamPing:
+	case unknownStreamEvent, contentBlockStart, contentBlockDelta, contentBlockStop, streamPing:
 	}
 }
 
@@ -118,6 +110,8 @@ func (t *streamUsageTracker) save() {
 }
 
 func (t *streamUsageTracker) finish() {
-	t.consumeLine(t.pending)
+	if t.splitter != nil {
+		t.splitter.Flush()
+	}
 	t.save()
 }

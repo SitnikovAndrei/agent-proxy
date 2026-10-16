@@ -95,7 +95,7 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 	clientUpgrader := ws.HTTPUpgrader{
 		Header: clientResponseHeaders,
 	}
-	if s.isShuttingDown() {
+	if s.lifecycle.IsStopping() {
 		upstreamConn.Close()
 		writeJSONError(w, r, http.StatusServiceUnavailable, "api_error", "service is shutting down")
 		return
@@ -110,11 +110,11 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 		clientConn:   clientConn,
 		upstreamConn: upstreamConn,
 	}
-	if !s.registerWebSocketSession(session) {
+	if !s.lifecycle.Register(session) {
 		session.Close()
 		return
 	}
-	defer s.unregisterWebSocketSession(session)
+	defer s.lifecycle.Unregister(session)
 
 	var upstreamReadWriter io.ReadWriter
 	if upstreamBufferedReader != nil {
@@ -126,26 +126,26 @@ func (s *Service) handleWebSocket(w http.ResponseWriter, r *http.Request, proxyP
 		upstreamReadWriter = upstreamConn
 	}
 
-	modelChannel := make(chan string, 1)
+	models := &responseModelQueue{}
 	var waitGroup sync.WaitGroup
 
 	waitGroup.Add(2)
 	go func() {
 		defer waitGroup.Done()
 		defer session.Close()
-		s.proxyWebSocketClientToUpstream(clientConn, upstreamConn, modelChannel)
+		s.proxyWebSocketClientToUpstream(clientConn, upstreamConn, models)
 	}()
 	go func() {
 		defer waitGroup.Done()
 		defer session.Close()
-		s.proxyWebSocketUpstreamToClient(upstreamReadWriter, clientConn, modelChannel, username, weeklyCycleHint)
+		s.proxyWebSocketUpstreamToClient(upstreamReadWriter, clientConn, models, username, weeklyCycleHint)
 	}()
 	waitGroup.Wait()
 }
 
-func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamConn net.Conn, modelChannel chan<- string) {
+func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamConn net.Conn, models *responseModelQueue) {
 	for {
-		data, opCode, err := wsutil.ReadClientData(clientConn)
+		data, opCode, err := readLimitedClientData(clientConn)
 		if err != nil {
 			if !isClosedOrCanceled(err) {
 				s.logger.Debug("read client websocket", "error", err)
@@ -158,11 +158,8 @@ func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamCo
 				Type  string `json:"type"`
 				Model string `json:"model"`
 			}
-			if json.Unmarshal(data, &request) == nil && request.Type == "response.create" && request.Model != "" {
-				select {
-				case modelChannel <- request.Model:
-				default:
-				}
+			if json.Unmarshal(data, &request) == nil && request.Type == "response.create" {
+				models.push(request.Model)
 			}
 		}
 
@@ -176,8 +173,8 @@ func (s *Service) proxyWebSocketClientToUpstream(clientConn net.Conn, upstreamCo
 	}
 }
 
-func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWriter, clientConn net.Conn, modelChannel <-chan string, username string, weeklyCycleHint *WeeklyCycleHint) {
-	var requestModel string
+func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWriter, clientConn net.Conn, models *responseModelQueue, username string, weeklyCycleHint *WeeklyCycleHint) {
+	finalized := make(map[string]struct{})
 	for {
 		data, opCode, err := wsutil.ReadServerData(upstreamReadWriter)
 		if err != nil {
@@ -188,20 +185,21 @@ func (s *Service) proxyWebSocketUpstreamToClient(upstreamReadWriter io.ReadWrite
 		}
 
 		if opCode == ws.OpText && s.usageTracker != nil {
-			select {
-			case model := <-modelChannel:
-				requestModel = model
-			default:
-			}
-
 			var event struct {
+				Type     string             `json:"type"`
+				Response responses.Response `json:"response"`
+			}
+			var kind struct {
 				Type string `json:"type"`
 			}
-			if json.Unmarshal(data, &event) == nil && event.Type == "response.completed" {
-				var streamEvent responses.ResponseStreamEventUnion
-				if json.Unmarshal(data, &streamEvent) == nil {
-					completedEvent := streamEvent.AsResponseCompleted()
-					usage, err := usageFromResponse(completedEvent.Response)
+			if json.Unmarshal(data, &kind) == nil && isFinalResponseEvent(kind.Type) && json.Unmarshal(data, &event) == nil {
+				_, duplicate := finalized[event.Response.ID]
+				if event.Response.ID == "" || !duplicate {
+					if event.Response.ID != "" {
+						finalized[event.Response.ID] = struct{}{}
+					}
+					requestModel := models.pop()
+					usage, err := usageFromResponse(event.Response)
 					if err != nil {
 						s.logger.Error("parse websocket usage", "error", err)
 					} else {

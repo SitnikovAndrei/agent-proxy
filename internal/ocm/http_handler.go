@@ -2,7 +2,6 @@ package ocm
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,17 +10,15 @@ import (
 	"ocm/internal/proxy"
 )
 
+type requestPayload struct {
+	model string
+	body  []byte
+}
+
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !s.registerRequest() {
+	s.lifecycle.ServeHTTP(w, r, s.serveRequest, func(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusServiceUnavailable, "api_error", "service is shutting down")
-		return
-	}
-	defer s.requestGroup.Done()
-	ctx, cancel := context.WithCancel(r.Context())
-	stop := context.AfterFunc(s.ctx, cancel)
-	defer stop()
-	defer cancel()
-	s.serveRequest(w, r.WithContext(ctx))
+	})
 }
 
 func (s *Service) serveRequest(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +32,12 @@ func (s *Service) serveRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	username, authenticated := s.authenticate(w, r)
 	if !authenticated {
+		return
+	}
+	payload, err := s.readRequestModel(w, r)
+	if err != nil {
+		status, message := proxy.RequestBodyError(err)
+		writeJSONError(w, r, status, "invalid_request_error", message)
 		return
 	}
 	credentials, err := s.credentialStore.read(r.Context())
@@ -51,7 +54,7 @@ func (s *Service) serveRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if path == "/v1/chat/completions" && !credentials.isAPIKeyMode() {
-		s.serveChatCompletions(w, r, username, credentials)
+		s.serveChatCompletions(w, r, username, credentials, payload.body)
 		return
 	}
 	proxyPath := path
@@ -59,14 +62,14 @@ func (s *Service) serveRequest(w http.ResponseWriter, r *http.Request) {
 		proxyPath = strings.TrimPrefix(path, "/v1")
 	}
 	if r.Method == http.MethodGet && path == "/v1/models" && !credentials.isAPIKeyMode() {
-		s.serveModels(w, r, proxyPath, credentials)
+		s.serveModels(w, r, proxyPath, credentials, payload.body)
 		return
 	}
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && strings.HasPrefix(path, "/v1/responses") {
 		s.handleWebSocket(w, r, proxyPath, username, credentials)
 		return
 	}
-	s.proxyHTTP(w, r, proxyPath, username, credentials)
+	s.proxyHTTP(w, r, proxyPath, username, credentials, payload)
 }
 
 func (s *Service) writeCredentialError(w http.ResponseWriter, r *http.Request, err error) {
@@ -84,13 +87,8 @@ func (s *Service) authenticate(w http.ResponseWriter, r *http.Request) (string, 
 	return username, true
 }
 
-func (s *Service) proxyHTTP(w http.ResponseWriter, r *http.Request, path, username string, credentials *oauthCredentials) {
-	requestModel, err := s.readRequestModel(r)
-	if err != nil {
-		writeJSONError(w, r, http.StatusBadRequest, "invalid_request_error", "cannot read request body")
-		return
-	}
-	request, err := s.buildProxyRequest(r, path, credentials)
+func (s *Service) proxyHTTP(w http.ResponseWriter, r *http.Request, path, username string, credentials *oauthCredentials, payload requestPayload) {
+	request, err := s.buildProxyRequest(r, path, credentials, payload.body)
 	if err != nil {
 		s.logger.Error("create proxy request", "error", err)
 		writeJSONError(w, r, http.StatusInternalServerError, "api_error", "Internal server error")
@@ -115,39 +113,56 @@ func (s *Service) proxyHTTP(w http.ResponseWriter, r *http.Request, path, userna
 	proxy.CopyHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	if trackUsage {
-		s.handleResponseWithTracking(w, response, r.URL.Path, requestModel, username)
+		s.handleResponseWithTracking(w, response, r.URL.Path, payload.model, username)
 		return
 	}
 	s.copyResponse(w, response)
 }
 
-func (s *Service) readRequestModel(r *http.Request) (string, error) {
-	if s.usageTracker == nil || r.Body == nil {
-		return "", nil
+func inspectsRequestBody(r *http.Request) bool {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
 	}
-	body, err := io.ReadAll(r.Body)
+	return r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" || strings.HasPrefix(r.URL.Path, "/v1/responses/")
+}
+
+func (s *Service) readRequestModel(w http.ResponseWriter, r *http.Request) (requestPayload, error) {
+	if !inspectsRequestBody(r) {
+		return requestPayload{}, nil
+	}
+	body, err := proxy.ReadRequestBody(w, r)
 	if err != nil {
-		return "", err
+		return requestPayload{}, err
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
 	var request struct {
 		Model string `json:"model"`
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
-		return "", nil
+		return requestPayload{body: body}, nil
 	}
-	return request.Model, nil
+	return requestPayload{model: request.Model, body: body}, nil
 }
 
-func (s *Service) buildProxyRequest(r *http.Request, path string, credentials *oauthCredentials) (*http.Request, error) {
+func (s *Service) buildProxyRequest(r *http.Request, path string, credentials *oauthCredentials, body []byte) (*http.Request, error) {
 	url := s.baseURL(credentials) + path
 	if r.URL.RawQuery != "" {
 		url += "?" + r.URL.RawQuery
 	}
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, url, r.Body)
+	var source io.Reader = r.Body
+	inspected := inspectsRequestBody(r)
+	if inspected {
+		source = bytes.NewReader(body)
+	} else if r.ContentLength == 0 || r.Body == nil || r.Body == http.NoBody {
+		source = http.NoBody
+	}
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, url, source)
 	if err != nil {
 		return nil, err
 	}
+	if !inspected {
+		request.ContentLength = r.ContentLength
+	}
 	request.Header = s.upstreamHeaders(r.Header, credentials)
+	request.Header.Del("Content-Length")
 	return request, nil
 }

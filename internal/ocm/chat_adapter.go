@@ -10,18 +10,13 @@ import (
 	"ocm/internal/proxy"
 )
 
-func (s *Service) serveChatCompletions(w http.ResponseWriter, r *http.Request, username string, credentials *oauthCredentials) {
+func (s *Service) serveChatCompletions(w http.ResponseWriter, r *http.Request, username string, credentials *oauthCredentials, body []byte) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, r, http.StatusMethodNotAllowed, "invalid_request_error", "chat completions requires POST")
 		return
 	}
 	if encoding := strings.TrimSpace(r.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
 		writeJSONError(w, r, http.StatusBadRequest, "invalid_request_error", "unsupported Content-Encoding")
-		return
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSONError(w, r, http.StatusBadRequest, "invalid_request_error", "cannot read request body")
 		return
 	}
 	converted, err := convertChatRequest(body)
@@ -115,8 +110,16 @@ func (s *Service) convertChatResponse(w http.ResponseWriter, r *http.Request, re
 	}
 	cycle := extractWeeklyCycleHint(response.Header)
 	err := readChatEvents(response.Body, func(event adapterEvent) error {
-		if output.failed && event.Type != "response.completed" && event.Type != "response.incomplete" {
+		if output.failed && event.Type != "response.completed" && event.Type != "response.incomplete" && event.Type != "response.failed" {
 			return nil
+		}
+		if event.Type == "response.failed" {
+			usage, err := usageFromResponse(event.Response)
+			if err != nil {
+				s.logger.Error("parse chat adapter usage", "error", err)
+			} else {
+				s.recordUsage(usage, request.model, username, cycle)
+			}
 		}
 		delta, err := state.consume(event)
 		if err != nil {

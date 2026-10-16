@@ -48,9 +48,14 @@ func (s *Service) serveRequest(writer http.ResponseWriter, incoming *http.Reques
 		writeJSONError(writer, incoming, http.StatusUnauthorized, "authentication_error", failure.Message())
 		return
 	}
-	metadata, err := s.readRequestMetadata(incoming)
+	metadata, body, err := s.readRequestMetadata(writer, incoming)
 	if err != nil {
-		writeJSONError(writer, incoming, http.StatusBadRequest, "invalid_request_error", "cannot read request body")
+		status, message := proxy.RequestBodyError(err)
+		errorType := "invalid_request_error"
+		if status == http.StatusRequestEntityTooLarge {
+			errorType = "request_too_large"
+		}
+		writeJSONError(writer, incoming, status, errorType, message)
 		return
 	}
 	metadata.username = username
@@ -60,7 +65,7 @@ func (s *Service) serveRequest(writer http.ResponseWriter, incoming *http.Reques
 		writeJSONError(writer, incoming, http.StatusUnauthorized, "authentication_error", "Authentication failed")
 		return
 	}
-	request, err := s.buildProxyRequest(incoming, credentials)
+	request, err := s.buildProxyRequest(incoming, credentials, body)
 	if err != nil {
 		writeJSONError(writer, incoming, http.StatusInternalServerError, "api_error", "cannot create upstream request")
 		return
@@ -69,29 +74,42 @@ func (s *Service) serveRequest(writer http.ResponseWriter, incoming *http.Reques
 	s.proxyRequest(writer, incoming, request, metadata)
 }
 
-func (s *Service) readRequestMetadata(request *http.Request) (requestMetadata, error) {
-	if s.usage == nil || request.Body == nil {
-		return requestMetadata{}, nil
+func inspectsRequestBody(request *http.Request) bool {
+	return request.URL.Path == "/v1/messages" || request.URL.Path == "/v1/messages/count_tokens"
+}
+
+func (s *Service) readRequestMetadata(writer http.ResponseWriter, request *http.Request) (requestMetadata, []byte, error) {
+	if !inspectsRequestBody(request) {
+		return requestMetadata{}, nil, nil
 	}
-	body, err := io.ReadAll(request.Body)
+	body, err := proxy.ReadRequestBody(writer, request)
 	if err != nil {
-		return requestMetadata{}, err
+		return requestMetadata{}, nil, err
 	}
-	request.Body = io.NopCloser(bytes.NewReader(body))
 	var payload struct {
 		Model    string            `json:"model"`
 		Messages []json.RawMessage `json:"messages"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return requestMetadata{}, nil
+		return requestMetadata{}, body, nil
 	}
-	return requestMetadata{model: payload.Model, messagesCount: len(payload.Messages)}, nil
+	return requestMetadata{model: payload.Model, messagesCount: len(payload.Messages)}, body, nil
 }
 
-func (s *Service) buildProxyRequest(incoming *http.Request, credentials oauthCredentials) (*http.Request, error) {
-	request, err := http.NewRequestWithContext(incoming.Context(), incoming.Method, s.baseURL+incoming.URL.RequestURI(), incoming.Body)
+func (s *Service) buildProxyRequest(incoming *http.Request, credentials oauthCredentials, body []byte) (*http.Request, error) {
+	var source io.Reader = incoming.Body
+	inspected := inspectsRequestBody(incoming)
+	if inspected {
+		source = bytes.NewReader(body)
+	} else if incoming.ContentLength == 0 || incoming.Body == nil || incoming.Body == http.NoBody {
+		source = http.NoBody
+	}
+	request, err := http.NewRequestWithContext(incoming.Context(), incoming.Method, s.baseURL+incoming.URL.RequestURI(), source)
 	if err != nil {
 		return nil, err
+	}
+	if !inspected {
+		request.ContentLength = incoming.ContentLength
 	}
 	proxy.CopyHeaders(request.Header, incoming.Header)
 	request.Header.Del("Authorization")
@@ -120,6 +138,7 @@ func (s *Service) buildProxyRequest(incoming *http.Request, credentials oauthCre
 		request.Header.Set("Anthropic-Beta", beta)
 	}
 	request.Header.Del("X-Api-Key")
+	request.Header.Del("Content-Length")
 	request.Header.Set("Authorization", "Bearer "+credentials.AccessToken)
 	return request, nil
 }

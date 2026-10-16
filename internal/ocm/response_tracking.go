@@ -3,6 +3,7 @@ package ocm
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -106,8 +107,9 @@ func parseJSONUsage(body []byte, chat bool) (responseUsage, error) {
 }
 
 type streamUsageTracker struct {
-	chat       bool
 	pending    []byte
+	chat       bool
+	splitter   *proxy.SSELineSplitter
 	usage      responseUsage
 	recorded   bool
 	record     func(responseUsage)
@@ -115,16 +117,26 @@ type streamUsageTracker struct {
 	parseError error
 }
 
-func (t *streamUsageTracker) consume(data []byte) {
-	t.pending = append(t.pending, data...)
-	for {
-		line, rest, found := bytes.Cut(t.pending, []byte("\n"))
-		if !found {
-			return
-		}
-		t.consumeLine(line)
-		t.pending = rest
+const maxUsageEventBytes = 16 << 20
+
+func isFinalResponseEvent(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed":
+		return true
+	default:
+		return false
 	}
+}
+
+func (t *streamUsageTracker) consume(data []byte) {
+	if t.splitter == nil {
+		t.splitter = &proxy.SSELineSplitter{Buffer: &t.pending,
+			Max: maxUsageEventBytes, OnLine: t.consumeLine,
+			Done:       func() bool { return t.recorded || t.parseError != nil },
+			OnOverflow: func() { t.fail(errors.New("OpenAI usage event exceeds 16 MiB")) },
+		}
+	}
+	t.splitter.Write(data)
 }
 
 func (t *streamUsageTracker) consumeLine(line []byte) {
@@ -140,11 +152,17 @@ func (t *streamUsageTracker) consumeLine(line []byte) {
 		t.consumeChatChunk(data)
 		return
 	}
+	var kind struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &kind) != nil || !isFinalResponseEvent(kind.Type) {
+		return
+	}
 	var event struct {
 		Type     string             `json:"type"`
 		Response responses.Response `json:"response"`
 	}
-	if json.Unmarshal(data, &event) == nil && event.Type == "response.completed" {
+	if json.Unmarshal(data, &event) == nil {
 		usage, err := usageFromResponse(event.Response)
 		if err != nil {
 			t.fail(err)
@@ -156,7 +174,17 @@ func (t *streamUsageTracker) consumeLine(line []byte) {
 }
 
 func (t *streamUsageTracker) consumeChatChunk(data []byte) {
-	var chunk openai.ChatCompletionChunk
+	var chunk struct {
+		Model       string `json:"model"`
+		ServiceTier string `json:"service_tier"`
+		Usage       struct {
+			PromptTokens        int64 `json:"prompt_tokens"`
+			CompletionTokens    int64 `json:"completion_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
 	if json.Unmarshal(data, &chunk) != nil {
 		return
 	}
@@ -187,7 +215,9 @@ func (t *streamUsageTracker) save() {
 }
 
 func (t *streamUsageTracker) finish() {
-	t.consumeLine(t.pending)
+	if t.splitter != nil {
+		t.splitter.Flush()
+	}
 	t.save()
 }
 

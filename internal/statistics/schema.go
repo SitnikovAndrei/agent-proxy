@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
  CHECK (cache_creation_5m_tokens + cache_creation_1h_tokens <= cache_creation_tokens)
 );
 CREATE INDEX IF NOT EXISTS usage_provider_user_time ON usage_records(provider, username, observed_at_utc);
+CREATE INDEX IF NOT EXISTS usage_provider_user_time_bound ON usage_records(provider, username, replace(observed_at_utc,'Z',''));
 CREATE INDEX IF NOT EXISTS usage_provider_week ON usage_records(provider, week_start_unix);
 `
 

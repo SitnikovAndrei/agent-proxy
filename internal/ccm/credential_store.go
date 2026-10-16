@@ -2,8 +2,6 @@ package ccm
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"time"
 
@@ -17,57 +15,25 @@ type credentialStore struct {
 	timeout  time.Duration
 }
 
-func (s *credentialStore) load(ctx context.Context) (result oauthCredentials, err error) {
-	document, err := readCredentialDocument(ctx, s.path)
-	if err != nil {
-		return oauthCredentials{}, err
-	}
-	if !document.credentials.needsRefresh() {
-		return document.credentials, nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
-	lock, err := persistence.LockCredentials(ctx, s.path)
-	if err != nil {
-		return oauthCredentials{}, err
-	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-	return s.refresh(ctx, lock)
-}
-
-func (s *credentialStore) refresh(ctx context.Context, lock *persistence.CredentialLock) (oauthCredentials, error) {
-	for {
-		document, err := readCredentialDocument(ctx, s.path)
-		if err != nil {
-			return oauthCredentials{}, err
-		}
-		if !document.credentials.needsRefresh() {
-			return document.credentials, nil
-		}
-		if err := lock.BeginRotation(ctx, document.credentials.RefreshToken, document.credentials.AccessToken); err != nil {
-			return oauthCredentials{}, err
-		}
-		refreshed, err := refreshToken(ctx, s.client, document.credentials, s.tokenURL)
-		if err != nil {
-			return oauthCredentials{}, err
-		}
-		persistContext := context.WithoutCancel(ctx)
-		current, err := readCredentialDocument(persistContext, s.path)
-		if err != nil {
-			return oauthCredentials{}, err
-		}
-		if refreshCredentialsChanged(document.credentials, current.credentials) {
-			continue
-		}
-		if err := current.write(persistContext, s.path, refreshed); err != nil {
-			return oauthCredentials{}, fmt.Errorf("persist refreshed credentials: %w", err)
-		}
-		if err := lock.CompleteRotation(); err != nil {
-			return oauthCredentials{}, fmt.Errorf("commit credential rotation: %w", err)
-		}
-		current, err = readCredentialDocument(persistContext, s.path)
-		return current.credentials, err
-	}
+func (s *credentialStore) load(ctx context.Context) (oauthCredentials, error) {
+	document, err := persistence.RefreshUnderLock(ctx, s.path, s.timeout, persistence.RefreshOps[credentialDocument]{
+		Read:         func(ctx context.Context) (credentialDocument, error) { return readCredentialDocument(ctx, s.path) },
+		NeedsRefresh: func(d credentialDocument) bool { return d.credentials.needsRefresh() },
+		Tokens: func(d credentialDocument) (string, string) {
+			return d.credentials.RefreshToken, d.credentials.AccessToken
+		},
+		Refresh: func(ctx context.Context, d credentialDocument) (credentialDocument, error) {
+			c, err := refreshToken(ctx, s.client, d.credentials, s.tokenURL)
+			return credentialDocument{credentials: c}, err
+		},
+		Changed: func(before, current credentialDocument) bool {
+			return refreshCredentialsChanged(before.credentials, current.credentials)
+		},
+		Write: func(ctx context.Context, current, refreshed credentialDocument) error {
+			return current.write(ctx, s.path, refreshed.credentials)
+		},
+	})
+	return document.credentials, err
 }
 
 func refreshCredentialsChanged(before, after oauthCredentials) bool {

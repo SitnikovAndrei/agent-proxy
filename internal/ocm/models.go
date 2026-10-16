@@ -15,10 +15,10 @@ import (
 const codexCatalogClientVersion = "0.162.1"
 const maxModelsResponseBytes = 8 << 20
 
-func (s *Service) serveModels(w http.ResponseWriter, incoming *http.Request, path string, credentials *oauthCredentials) {
+func (s *Service) serveModels(w http.ResponseWriter, incoming *http.Request, path string, credentials *oauthCredentials, body []byte) {
 	ctx, cancel := context.WithTimeout(incoming.Context(), 30*time.Second)
 	defer cancel()
-	request, err := s.buildProxyRequest(incoming.WithContext(ctx), path, credentials)
+	request, err := s.buildProxyRequest(incoming.WithContext(ctx), path, credentials, body)
 	if err != nil {
 		s.writeModelsError(w, incoming, err)
 		return

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"ocm/internal/config"
@@ -26,8 +25,8 @@ type Options struct {
 }
 
 type Service struct {
+	lifecycle         *proxy.Lifecycle
 	ctx               context.Context
-	cancel            context.CancelFunc
 	logger            *slog.Logger
 	credentialStore   *credentialStore
 	users             []config.User
@@ -35,17 +34,10 @@ type Service struct {
 	httpClient        *http.Client
 	httpHeaders       http.Header
 	listener          net.Listener
-	httpServer        *http.Server
 	options           Options
 	userManager       *proxy.UserManager
 	usageTracker      *usageTracker
 	statistics        *statistics.Handler
-	webSocketMutex    sync.Mutex
-	webSocketConns    map[*webSocketSession]struct{}
-	shuttingDown      bool
-	requestGroup      sync.WaitGroup
-	closeOnce         sync.Once
-	closeError        error
 	openaiAPIBaseURL  string
 	chatGPTBackendURL string
 }
@@ -68,13 +60,13 @@ func NewService(opts Options, logger *slog.Logger, store *statistics.Store) (*Se
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	client := proxy.NewHTTPClient(dialer)
 	s := &Service{
-		ctx: ctx, cancel: cancel, logger: logger, options: opts,
+		ctx: ctx, logger: logger, options: opts,
 		users: opts.Users, dialer: dialer, httpClient: client,
 		credentialStore: createCredentialStore(path, client, opts),
 		httpHeaders:     opts.Headers.Build(), userManager: &proxy.UserManager{},
-		webSocketConns:   make(map[*webSocketSession]struct{}),
 		openaiAPIBaseURL: openaiAPIBaseURL, chatGPTBackendURL: chatGPTBackendURL,
 	}
+	s.lifecycle = proxy.NewLifecycle(ctx, cancel, logger, client, context.DeadlineExceeded)
 	if opts.openaiAPIBaseURL != "" {
 		s.openaiAPIBaseURL = opts.openaiAPIBaseURL
 	}
@@ -96,19 +88,9 @@ func (s *Service) Start() error {
 	if _, err := s.credentialStore.read(s.ctx); err != nil {
 		return fmt.Errorf("read credentials: %w", err)
 	}
-	listener, err := proxy.Listen(s.options.Config)
-	if err != nil {
-		return err
-	}
-	s.listener = listener
-	s.httpServer = &http.Server{Handler: s, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second}
-	go func() {
-		if err := s.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("serve error", "error", err)
-		}
-	}()
-	s.logger.Info("listening on " + listener.Addr().String())
-	return nil
+	var err error
+	s.listener, err = s.lifecycle.Start(s.options.Config, s, func(address net.Addr) { s.logger.Info("listening on " + address.String()) })
+	return err
 }
 
 func (s *Service) baseURL(credentials *oauthCredentials) string {

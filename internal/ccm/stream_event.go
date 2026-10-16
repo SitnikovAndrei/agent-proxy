@@ -1,14 +1,12 @@
 package ccm
 
-import (
-	"encoding/json"
-	"errors"
-)
+import "encoding/json"
 
 type streamEventType uint8
 
 const (
-	messageStart streamEventType = iota
+	unknownStreamEvent streamEventType = iota
+	messageStart
 	messageDelta
 	messageStop
 	contentBlockStart
@@ -41,7 +39,7 @@ func (t *streamEventType) UnmarshalJSON(data []byte) error {
 	case "error":
 		*t = streamError
 	default:
-		return errors.New("unsupported Anthropic stream event type")
+		*t = unknownStreamEvent
 	}
 	return nil
 }

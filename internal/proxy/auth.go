@@ -71,8 +71,8 @@ func (m *UserManager) authorize(request *http.Request, statistics bool) (string,
 	if header == "" {
 		return "", MissingAuthorization
 	}
-	token, valid := strings.CutPrefix(header, "Bearer ")
-	if !valid {
+	scheme, token, valid := strings.Cut(header, " ")
+	if !valid || !strings.EqualFold(scheme, "Bearer") {
 		return "", InvalidAuthorization
 	}
 	username, found := m.tokens[token]

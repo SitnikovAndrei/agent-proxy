@@ -2,8 +2,6 @@ package ocm
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"path/filepath"
 	"time"
@@ -39,53 +37,20 @@ func (s *credentialStore) read(ctx context.Context) (*oauthCredentials, error) {
 	return readCredentialsFromFile(ctx, s.path)
 }
 
-func (s *credentialStore) load(ctx context.Context) (result *oauthCredentials, err error) {
-	credentials, err := s.read(ctx)
-	if err != nil || !credentials.needsRefresh() {
-		return credentials, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
-	lock, err := persistence.LockCredentials(ctx, s.path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-	return s.refresh(ctx, lock)
-}
-
-func (s *credentialStore) refresh(ctx context.Context, lock *persistence.CredentialLock) (*oauthCredentials, error) {
-	for {
-		credentials, err := s.read(ctx)
-		if err != nil || !credentials.needsRefresh() {
-			return credentials, err
-		}
-		if err := lock.BeginRotation(ctx, credentials.Tokens.RefreshToken, credentials.Tokens.AccessToken); err != nil {
-			return nil, err
-		}
-		refreshed, err := refreshToken(ctx, s.client, credentials, s.tokenURL)
-		if err != nil {
-			return nil, err
-		}
-		// A successful refresh rotates tokens; persist them even if the caller just canceled.
-		persistContext := context.WithoutCancel(ctx)
-		current, err := readCredentialsFromFile(persistContext, s.path)
-		if err != nil {
-			return nil, err
-		}
-		if !credentialsEqual(credentials, current) {
-			continue
-		}
-		// Preserve metadata changed during refresh without rotating the token again.
-		refreshed.document = current.document
-		if err := writeCredentialsToFile(persistContext, refreshed, s.path); err != nil {
-			return nil, fmt.Errorf("persist refreshed credentials: %w", err)
-		}
-		if err := lock.CompleteRotation(); err != nil {
-			return nil, fmt.Errorf("commit credential rotation: %w", err)
-		}
-		return s.read(persistContext)
-	}
+func (s *credentialStore) load(ctx context.Context) (*oauthCredentials, error) {
+	return persistence.RefreshUnderLock(ctx, s.path, s.timeout, persistence.RefreshOps[*oauthCredentials]{
+		Read:         s.read,
+		NeedsRefresh: func(c *oauthCredentials) bool { return c.needsRefresh() },
+		Tokens:       func(c *oauthCredentials) (string, string) { return c.Tokens.RefreshToken, c.Tokens.AccessToken },
+		Refresh: func(ctx context.Context, c *oauthCredentials) (*oauthCredentials, error) {
+			return refreshToken(ctx, s.client, c, s.tokenURL)
+		},
+		Changed: func(before, current *oauthCredentials) bool { return !credentialsEqual(before, current) },
+		Write: func(ctx context.Context, current, refreshed *oauthCredentials) error {
+			refreshed.document = current.document
+			return writeCredentialsToFile(ctx, refreshed, s.path)
+		},
+	})
 }
 
 func credentialsEqual(left, right *oauthCredentials) bool {

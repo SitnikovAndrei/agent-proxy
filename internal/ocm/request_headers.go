@@ -28,8 +28,12 @@ func (s *Service) upstreamHeaders(incoming http.Header, credentials *oauthCreden
 	headers.Del("Cookie")
 	headers.Del("ChatGPT-Account-Id")
 	headers.Del("X-Openai-Internal-Codex-Residency")
-	headers.Set("User-Agent", codexUserAgent)
-	headers.Set("Originator", codexOriginator)
+	if _, configured := headers["User-Agent"]; !configured {
+		headers.Set("User-Agent", codexUserAgent)
+	}
+	if _, configured := headers["Originator"]; !configured {
+		headers.Set("Originator", codexOriginator)
+	}
 	headers.Set("Authorization", "Bearer "+credentials.getAccessToken())
 	if accountID := credentials.getAccountID(); accountID != "" {
 		headers.Set("ChatGPT-Account-Id", accountID)
@@ -44,7 +48,7 @@ func isAllowedClientHeader(key string) bool {
 	switch http.CanonicalHeaderKey(key) {
 	case "Oai-Product-Sku", "Accept":
 		return true
-	case "Content-Type", "Content-Encoding", "Accept-Encoding", "Openai-Beta":
+	case "Content-Type", "Content-Encoding", "Openai-Beta":
 		return true
 	default:
 		return false
