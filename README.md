@@ -114,7 +114,29 @@ TLS-конфигурация отклоняются при загрузке.
 `auth.json` с `OPENAI_API_KEY` включает режим API key: путь `/v1/...` сохраняется.
 При OAuth (`tokens.access_token`, `tokens.refresh_token`, `tokens.account_id`,
 `last_refresh`) `/v1/responses` направляется на Codex backend `/responses`;
-`/v1/chat/completions` возвращает 400. При наличии refresh token и JWT `exp`
+POST `/v1/chat/completions` использует адаптер Chat Completions → Responses.
+Он переносит system/developer в `instructions`, сообщения и изображения/файлы
+в `input`, преобразует function tools, tool calls и их результаты, `tool_choice`,
+`reasoning_effort`, `response_format` и `verbosity`. Ответ SSE преобразуется
+в chat chunks или собирается в JSON по клиентскому `stream`; `include_usage`
+в `stream_options` включает отдельный usage chunk. Responses-подобное тело
+с `input` без `messages` также принимается: неизвестные поля сохраняются,
+`metadata` и `stream_options` удаляются. Upstream всегда получает
+`stream: true` и `store: false`.
+
+В Chat-формате отбрасываются `temperature`, `top_p`, `max_tokens`,
+`max_completion_tokens`, `presence_penalty`, `frequency_penalty`, `seed`,
+`user`, `metadata`, `store` и прочитанный `stream_options`; пустой/null
+`logit_bias` также отбрасывается. Несовместимые параметры дают 400:
+`n > 1`, `logprobs: true`, `top_logprobs > 0`, непустой `logit_bias`,
+аудио и modalities кроме text, `prediction`, `web_search_options`,
+устаревшие `functions`/`function_call`, роль `function`, неизвестные роли,
+типы частей/инструментов и верхнеуровневые поля. Неверный JSON, отсутствие
+`messages`/`input`, пустой `model` в Chat-формате и сжатое тело запроса также
+дают 400; метод кроме POST — 405. API key режим сохраняет прозрачный проксинг.
+Совместимость адаптера с реальным Codex backend не гарантируется локальными тестами.
+
+При наличии refresh token и JWT `exp`
 OAuth-токен обновляется за 120 секунд до истечения. Срок из JWT имеет приоритет
 над `last_refresh`. Если `exp` отсутствует, применяется прежнее правило:
 обновление при отсутствии `last_refresh` либо спустя 8 дней. Неверный тип или

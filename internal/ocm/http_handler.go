@@ -43,16 +43,16 @@ func (s *Service) serveRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
-	if path == "/v1/chat/completions" && !credentials.isAPIKeyMode() {
-		writeJSONError(w, r, http.StatusBadRequest, "invalid_request_error", "chat completions endpoint is only available in API key mode")
-		return
-	}
 	if credentials.needsRefresh() {
 		credentials, err = s.credentialStore.load(r.Context())
 		if err != nil {
 			s.writeCredentialError(w, r, err)
 			return
 		}
+	}
+	if path == "/v1/chat/completions" && !credentials.isAPIKeyMode() {
+		s.serveChatCompletions(w, r, username, credentials)
+		return
 	}
 	proxyPath := path
 	if !credentials.isAPIKeyMode() {

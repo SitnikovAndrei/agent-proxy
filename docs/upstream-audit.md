@@ -17,7 +17,7 @@ commit `e4b7e692f4545890bfc9d43960328e1449fa803b`.
 | Обязанность | sing-box и прежний путь | Текущий путь |
 | --- | --- | --- |
 | OCM API key | OpenAI `/v1/...`, серверный bearer | Сохранено |
-| OCM OAuth | Codex backend, удаление `/v1`, запрет chat completions | Сохранено |
+| OCM OAuth | Codex backend, удаление `/v1`; вместо запрета chat completions — адаптер в `/responses` (сообщения, SSE, function tools; всегда stream=true/store=false) | Осознанное отличие от upstream; API key проксирование сохранено |
 | Query и клиентские заголовки | Передача query, User-Agent, originator, beta и остальных заголовков; конфиг заменяет одноимённые | Query сохранён; в OCM клиентские заголовки ограничены списком из README по запросу пользователя, Cookie удаляется; явно настроенные заголовки сохраняются |
 | `client_version` | sing-box передаёт полученный query; сам Codex добавляет версию | Для OAuth GET `/v1/models` добавляется документированная версия, только если параметр отсутствует |
 | Каталог моделей | Прозрачный ответ Codex `{models: [...]}` | Исходный `models[]` сохранён без изменения полей; добавлены OpenAI `object` и минимальный `data` (`id`, `object`, `created`, `owned_by`); ETag преобразованного ответа удалён |

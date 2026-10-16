@@ -98,10 +98,13 @@ Hermes преобразует сообщения в Responses input, форми�
 `codex app-server`. На Python 3.14+ реализовано zstd-сжатие исходящих запросов
 Responses к официальному backend; это транспортная оптимизация.
 
-У нас OAuth OCM передаёт тело Responses без изменения, chat completions
-отклоняет. Поэтому произвольный OpenAI-клиент не получает автоматически
-совместимость с ограничениями Codex backend. Конвертация Chat Completions,
-SSE и tool calls была бы отдельным адаптером с собственным внешним контрактом.
+У нас OAuth OCM передаёт тело `/v1/responses` без изменения, а для POST
+`/v1/chat/completions` есть адаптер сообщений, SSE и function tool calls
+в Codex `/responses` и обратно. Он также принимает Responses-подобный `input`,
+всегда задаёт upstream `stream: true`, `store: false`, отбрасывает
+непринимаемые параметры генерации и отклоняет неподдерживаемые возможности
+с 400 (подробности в README). Это осознанное отличие от upstream OCM;
+совместимость с реальным backend требует отдельной проверки.
 Преобразования истории и запуск app-server относятся к ответственности harness.
 
 Источники: [codex_headers.py](https://github.com/NousResearch/hermes-agent/blob/3b63f7b0a4c7beb9eadbce2f15b9da75d01f5065/agent/codex_headers.py),

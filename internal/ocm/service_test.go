@@ -129,9 +129,9 @@ func TestHTTPRoutingAndSSEUsage(t *testing.T) {
 			defer upstream.Close()
 			service := startTestService(t, upstream.URL, oauth, io.Discard)
 			if oauth {
-				status, _, _ := requestService(t, service, "/v1/chat/completions", "Bearer client-key")
-				if status != http.StatusBadRequest {
-					t.Fatalf("chat status: %d", status)
+				status, _, body := requestService(t, service, "/v1/chat/completions", "Bearer client-key")
+				if status != http.StatusBadRequest || !bytes.Contains(body, []byte("messages or input is required")) {
+					t.Fatalf("chat status: %d, body: %s", status, body)
 				}
 			}
 			status, _, body := requestService(t, service, "/v1/responses?test=1", "Bearer client-key")
